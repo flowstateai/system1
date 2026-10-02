@@ -159,6 +159,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+        if (params.n_seq_decision > 0) {
+            params.kv_unified = true;
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
@@ -217,6 +220,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.post_props                  = models_routes->proxy_post;
         routes.post_completions            = models_routes->proxy_post;
         routes.post_completions_oai        = models_routes->proxy_post;
+        routes.post_decisions              = models_routes->proxy_post;
+        routes.post_systemone              = models_routes->proxy_post;
+        routes.post_clm_rank               = models_routes->proxy_post;
         routes.post_chat_completions       = models_routes->proxy_post;
         routes.post_control                = models_routes->proxy_post;
         routes.post_responses_oai          = models_routes->proxy_post;
@@ -258,6 +264,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
+    ctx_http.post("/v1/decisions",             ex_wrapper(routes.post_decisions));
+    ctx_http.post("/v1/system1/decisions",     ex_wrapper(routes.post_decisions));
+    ctx_http.post("/v1/systemone",             ex_wrapper(routes.post_systemone));
+    ctx_http.post("/v1/rank",                  ex_wrapper(routes.post_clm_rank));
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions/control", ex_wrapper(routes.post_control));

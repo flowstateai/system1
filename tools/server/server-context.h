@@ -137,6 +137,9 @@ struct server_routes {
     server_http_context::handler_t post_infill;
     server_http_context::handler_t post_completions;
     server_http_context::handler_t post_completions_oai;
+    server_http_context::handler_t post_decisions;
+    server_http_context::handler_t post_systemone;
+    server_http_context::handler_t post_clm_rank;
     server_http_context::handler_t post_chat_completions;
     server_http_context::handler_t post_chat_completions_tok;
     server_http_context::handler_t post_control;

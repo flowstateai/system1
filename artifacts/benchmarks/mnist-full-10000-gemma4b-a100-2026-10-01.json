@@ -1,0 +1,49 @@
+{
+  "provenance": "Aggregate results supplied by Miguel Mendez on 2026-10-01; per-batch logs are not included",
+  "dataset": "MNIST test set",
+  "images": 10000,
+  "batch_size": 16,
+  "batches": 625,
+  "model": "Gemma 4B",
+  "gpu": "A100",
+  "units": "milliseconds per 16-image batch unless otherwise stated",
+  "modes": {
+    "normal_structured_output": {
+      "correct": 9480,
+      "accuracy_percent": 94.80,
+      "answer_mean_ms": 1742.5,
+      "answer_p95_ms": 1840.2,
+      "full_batch_mean_ms": 2703
+    },
+    "system1_first_pass": {
+      "correct": 9501,
+      "accuracy_percent": 95.01,
+      "answer_mean_ms": 53.2,
+      "answer_p95_ms": 53.9,
+      "full_batch_mean_ms": 1200
+    },
+    "system1_cached": {
+      "correct": 9501,
+      "accuracy_percent": 95.01,
+      "answer_mean_ms": 50.8,
+      "answer_p95_ms": 51.4,
+      "full_batch_mean_ms": 212
+    }
+  },
+  "derived": {
+    "answer_first_pass_speedup": 32.75,
+    "answer_cached_speedup": 34.30,
+    "full_first_pass_speedup": 2.25,
+    "full_cached_speedup": 12.75,
+    "amortized_full_ms_per_image": {
+      "normal_structured_output": 168.9375,
+      "system1_first_pass": 75,
+      "system1_cached": 13.25
+    },
+    "amortized_answer_ms_per_image": {
+      "normal_structured_output": 108.90625,
+      "system1_first_pass": 3.325,
+      "system1_cached": 3.175
+    }
+  }
+}

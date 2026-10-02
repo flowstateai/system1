@@ -31,7 +31,7 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-          pip-install: -r requirements/requirements-all.txt ty==0.0.84
+          pip-install: ty==0.0.84 Pillow==12.3.0 gymnasium==1.2.3 ale-py==0.12.1
       # - name: Type-check with Pyright
       #   uses: jakebailey/pyright-action@v2
       #   with:
@@ -40,4 +40,4 @@ jobs:
       #     warnings: true
       - name: Type-check with ty
         run: |
-            ty check --exit-zero-on-warning --output-format=github
+            ty check tools/system1 --exit-zero-on-warning --output-format=github

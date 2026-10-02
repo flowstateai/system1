@@ -8,6 +8,8 @@ deprecated = "warn"
 [src]
 exclude = [
     "./tools/mtmd/legacy-models/**",
+    # Historical experiments are kept for reference; active System1 scripts are checked.
+    "./tools/system1/triage/**",
 ]
 
 [[overrides]]

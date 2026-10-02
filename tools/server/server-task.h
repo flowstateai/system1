@@ -27,6 +27,9 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_DECISION,
+    SERVER_TASK_TYPE_SYSTEMONE,
+    SERVER_TASK_TYPE_CLM_RANK,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -152,6 +155,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    json decision_body;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -291,6 +295,11 @@ struct server_task_result {
     virtual server_task_result * clone() const {
         GGML_ABORT("not implemented for this task type");
     }
+};
+
+struct server_task_result_decision : server_task_result {
+    json data;
+    json to_json() override { return data; }
 };
 
 // using shared_ptr for polymorphism of server_task_result

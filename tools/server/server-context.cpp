@@ -6,6 +6,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-finite-scorer.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -26,6 +27,9 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <cmath>
+#include <ctime>
+#include <set>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -46,6 +50,8 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+
+    result.total += params.n_seq_decision;
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
@@ -894,6 +900,8 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+    std::unique_ptr<flowstate_decision::scorer> finite_scorer;
+    server_prompt decision_prompt;
 
     server_metrics metrics;
 
@@ -2352,6 +2360,485 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    // A finite-answer request uses the server's sequence and RAM prompt cache. Only the
+    // answer-path scorer is separate; it never owns or restores a prompt cache.
+    json handle_decision(const json & body) {
+        if (params_base.n_seq_decision < 3) {
+            throw std::invalid_argument("start llama-server with --decision-seqs N (N >= 3)");
+        }
+        if (!body.contains("catalogue") || !body.at("catalogue").is_object() ||
+            !body.at("catalogue").contains("properties") || !body.at("catalogue").at("properties").is_object()) {
+            throw std::invalid_argument("catalogue must be an object JSON Schema with properties");
+        }
+        if (!body.contains("states") || !body.at("states").is_array() ||
+            body.at("states").empty() || body.at("states").size() > 32) {
+            throw std::invalid_argument("states must contain 1-32 items");
+        }
+        if (body.value("mode", std::string("tree")) != "tree") {
+            throw std::invalid_argument("full distributions require tree mode");
+        }
+        const std::string catalogue_position = body.value("catalogue_position", std::string("system"));
+        if (catalogue_position != "system" && catalogue_position != "after_media" &&
+            catalogue_position != "after_context") {
+            throw std::invalid_argument("catalogue_position must be system, after_media, or after_context");
+        }
+        if (!finite_scorer) {
+            finite_scorer = std::make_unique<flowstate_decision::scorer>(
+                ctx_tgt, (llama_seq_id) params_base.n_parallel, params_base.n_seq_decision);
+        }
+        const bool cache_enabled = body.value("cache_prompt", true);
+        const auto text_parts = [](const json & parts) {
+            if (!parts.is_array()) throw std::invalid_argument("content must be an array of parts");
+            std::string result;
+            for (const auto & part : parts) {
+                if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
+                    throw std::invalid_argument("every content part needs a type");
+                }
+                const std::string type = part.at("type").get<std::string>();
+                if (type == "text") {
+                    result += part.at("text").get<std::string>();
+                } else if (type == "data") {
+                    result += part.at("data").dump();
+                } else if (type != "image_url" && type != "input_video") {
+                    throw std::invalid_argument("unsupported content part type: " + type);
+                }
+                result += "\n";
+                if (result.size() > 65536) throw std::invalid_argument("text content exceeds 64 KiB");
+            }
+            return result;
+        };
+        const auto media_count = [](const json & parts) {
+            if (!parts.is_array()) throw std::invalid_argument("content must be an array of parts");
+            size_t count = 0;
+            for (const auto & part : parts) {
+                if (!part.is_object() || !part.contains("type")) throw std::invalid_argument("invalid content part");
+                const std::string type = part.at("type").get<std::string>();
+                count += type == "image_url" || type == "input_video";
+            }
+            return count;
+        };
+        const json global = body.value("global_context", json::array());
+        const size_t global_media = media_count(global);
+        size_t total_media = global_media;
+        std::vector<std::string> ids;
+        std::vector<json> states;
+        std::set<std::string> seen;
+        for (const auto & state : body.at("states")) {
+            if (!state.is_object() || !state.contains("id") || !state.contains("content")) {
+                throw std::invalid_argument("each state needs id and content");
+            }
+            const std::string id = state.at("id").get<std::string>();
+            if (id.empty() || id.size() > 64 || !seen.insert(id).second) {
+                throw std::invalid_argument("state IDs must be unique and 1-64 bytes long");
+            }
+            total_media += media_count(state.at("content"));
+            ids.push_back(id);
+            states.push_back(state.at("content"));
+        }
+        if (total_media > 64) throw std::invalid_argument("at most 64 media parts are supported");
+        if (total_media && !mctx) throw std::invalid_argument("media requires a multimodal projector");
+        const bool catalogue_late = catalogue_position == "after_context" ||
+            (catalogue_position == "after_media" && total_media);
+        const auto cs = flowstate_decision::compile_schema(body.at("catalogue"), "");
+        const std::string system_text = catalogue_late ? cs.preamble_text : cs.system_text;
+        const bool shared_context = total_media == global_media;
+        flowstate_decision::options opt;
+        opt.mode = "tree";
+        flowstate_decision::batch_result scored;
+        size_t cached_tokens = 0;
+        double parse_ms = 0, projector_ms = 0;
+
+        const auto append_parts = [](json & target, const json & source) {
+            for (const auto & part : source) {
+                if (part.at("type") == "data") {
+                    target.push_back({ { "type", "text" }, { "text", part.at("data").dump() } });
+                } else {
+                    target.push_back(part);
+                }
+            }
+        };
+        const auto render = [&](const json & parts, const std::string & marker,
+                                std::vector<raw_buffer> & files) {
+            json chat = { { "messages", json::array({
+                { { "role", "system" }, { "content", system_text } },
+                { { "role", "user" }, { "content", parts } }
+            }) }, { "reasoning_effort", "none" },
+                { "chat_template_kwargs", { { "enable_thinking", false } } } };
+            const int64_t start = ggml_time_us();
+            const json rendered = oaicompat_chat_params_parse(chat, chat_params, files);
+            parse_ms += (ggml_time_us() - start) / 1000.0;
+            const std::string prompt = rendered.at("prompt").get<std::string>();
+            const size_t at = prompt.find(marker);
+            if (at == std::string::npos || prompt.find(marker, at + marker.size()) != std::string::npos) {
+                throw std::runtime_error("chat template did not preserve decision boundary");
+            }
+            return std::pair<std::string, std::string>(prompt.substr(0, at), prompt.substr(at + marker.size()));
+        };
+
+        // Score one shared prompt. The upstream RAM prompt cache holds the stable text prefix
+        // before media; the upstream live sequence holds the full media prefix while unchanged.
+        const auto score_prompt = [&](const std::string & prompt, const std::vector<raw_buffer> & files,
+                                      const std::vector<std::string> & tails) {
+            size_t media_bytes = 0;
+            for (const auto & file : files) media_bytes += file.size();
+            if (media_bytes > 16 * 1024 * 1024) throw std::invalid_argument("media exceeds 16 MiB");
+            server_tokens view = mctx
+                ? process_mtmd_prompt(mctx, prompt, files, init_opt)
+                : server_tokens(common_tokenize(llama_model_get_vocab(model_tgt), prompt, true, true), false);
+            if (view.empty()) throw std::invalid_argument("empty decision prompt");
+            const llama_seq_id seq = finite_scorer->snapshot_seq();
+            llama_memory_t mem = llama_get_memory(ctx_tgt);
+            size_t start_idx = 0;
+            const size_t live_size = decision_prompt.tokens.size();
+            const bool exact_live_prefix = live_size <= view.size() &&
+                decision_prompt.tokens.get_common_prefix(view) == live_size;
+            if (cache_enabled && exact_live_prefix &&
+                (live_size == view.size() || catalogue_position == "after_context")) {
+                start_idx = live_size;
+            } else {
+                llama_memory_seq_rm(mem, seq, -1, -1);
+                decision_prompt.clear();
+                if (cache_enabled && prompt_cache) {
+                    prompt_cache->load(decision_prompt, view, ctx_tgt, nullptr, seq);
+                    start_idx = decision_prompt.tokens.get_common_prefix(view);
+                    if (start_idx != decision_prompt.tokens.size()) {
+                        llama_memory_seq_rm(mem, seq, -1, -1);
+                        decision_prompt.clear();
+                        start_idx = 0;
+                    }
+                }
+            }
+            const llama_pos reuse_pos = view.pos_next(start_idx);
+            cached_tokens += cache_enabled ? start_idx : 0;
+            const auto save_static = [&](size_t count) {
+                if (!cache_enabled || !prompt_cache || count == 0) return;
+                llama_synchronize(ctx_tgt);
+                server_prompt prefix;
+                prefix.tokens = view.clone();
+                prefix.tokens.keep_first(count);
+                const size_t size = llama_state_seq_get_size_ext(ctx_tgt, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+                auto * entry = prompt_cache->alloc(prefix, size, 0);
+                if (entry) {
+                    llama_state_seq_get_data_ext(ctx_tgt, entry->data.main.data(), size, seq, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    prompt_cache->update();
+                }
+            };
+            const auto prefill = [&](llama_seq_id target, llama_pos from) -> llama_pos {
+                if (target != seq || from != reuse_pos) throw std::runtime_error("invalid scorer prefill state");
+                llama_pos pos = from;
+                size_t i = start_idx;
+                bool saved_static = false;
+                // A text append can retokenize a few tokens at the join. Qwen's recurrent
+                // state cannot generally roll back those tokens, so keep a checkpoint just
+                // before the end of a context intended for later appends.
+                const size_t append_checkpoint = catalogue_position == "after_context" && view.size() > 8
+                    ? view.size() - 8 : 0;
+                bool saved_append_checkpoint = false;
+                llama_batch batch = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
+                const auto flush = [&]() {
+                    if (!batch.n_tokens) return;
+                    const int rc = llama_decode(ctx_tgt, batch);
+                    batch.n_tokens = 0;
+                    if (rc != 0) throw std::runtime_error("failed to prefill decision text");
+                };
+                try {
+                    for (; i < view.size();) {
+                        if (append_checkpoint && !saved_append_checkpoint && i == append_checkpoint) {
+                            flush();
+                            save_static(i);
+                            saved_append_checkpoint = true;
+                        }
+                        if (view[i] != LLAMA_TOKEN_NULL) {
+                            if (batch.n_tokens == (int) llama_n_batch(ctx_tgt)) flush();
+                            const int row = batch.n_tokens++;
+                            batch.token[row] = view[i++];
+                            batch.pos[row] = pos++;
+                            batch.n_seq_id[row] = 1;
+                            batch.seq_id[row][0] = seq;
+                            batch.logits[row] = false;
+                            continue;
+                        }
+                        flush();
+                        if (!saved_static) {
+                            save_static(i);
+                            saved_static = true;
+                        }
+                        const auto & chunk = view.find_chunk(i);
+                        mtmd::batch_ptr media_batch(mtmd_batch_init(mctx));
+                        if (mtmd_batch_add_chunk(media_batch.get(), chunk.get()) != 0) {
+                            throw std::runtime_error("failed to prepare media chunk");
+                        }
+                        const int64_t encode_start = ggml_time_us();
+                        if (mtmd_batch_encode(media_batch.get()) != 0) {
+                            throw std::runtime_error("failed to encode media chunk");
+                        }
+                        projector_ms += (ggml_time_us() - encode_start) / 1000.0;
+                        float * embd = mtmd_batch_get_output_embd(media_batch.get(), chunk.get());
+                        llama_pos next = pos;
+                        if (!embd || mtmd_helper_decode_image_chunk(mctx, ctx_tgt, chunk.get(), embd,
+                                pos, seq, llama_n_batch(ctx_tgt), &next, nullptr, nullptr) != 0) {
+                            throw std::runtime_error("failed to prefill media chunk");
+                        }
+                        pos = next;
+                        i += mtmd_input_chunk_get_n_tokens(chunk.get());
+                    }
+                    flush();
+                } catch (...) {
+                    llama_batch_free(batch);
+                    throw;
+                }
+                llama_batch_free(batch);
+                decision_prompt.tokens = view.clone();
+                return pos;
+            };
+            auto item = finite_scorer->decide_batch_prefilled(tails, cs.inputs, opt, prefill, reuse_pos);
+            scored.shared_tokens += item.shared_tokens;
+            scored.rows += item.rows;
+            scored.rounds += item.rounds;
+            scored.prefill_ms += item.prefill_ms;
+            scored.scoring_ms += item.scoring_ms;
+            for (auto & result : item.items) scored.items.push_back(std::move(result));
+        };
+
+        const std::string marker = "<|flowstate-decision-boundary|>";
+        if (shared_context) {
+            json parts = json::array();
+            parts.push_back({ { "type", "text" }, { "text", "## Global context\n" } });
+            append_parts(parts, global);
+            parts.push_back({ { "type", "text" }, { "text", marker } });
+            std::vector<raw_buffer> files;
+            auto [prefix, end] = render(parts, marker, files);
+            std::vector<std::string> tails;
+            for (const auto & state : states) {
+                tails.push_back((catalogue_late ? "\n" + cs.catalogue_text : "") +
+                    "\n## State\n" + text_parts(state) + end + "{\n");
+            }
+            score_prompt(prefix, files, tails);
+        } else {
+            for (const auto & state : states) {
+                json parts = json::array();
+                parts.push_back({ { "type", "text" }, { "text", "## Global context\n" } });
+                append_parts(parts, global);
+                parts.push_back({ { "type", "text" }, { "text", "\n## State\n" } });
+                append_parts(parts, state);
+                if (catalogue_late) parts.push_back({ { "type", "text" }, { "text", "\n" + cs.catalogue_text } });
+                parts.push_back({ { "type", "text" }, { "text", marker } });
+                std::vector<raw_buffer> files;
+                auto [prefix, end] = render(parts, marker, files);
+                score_prompt(prefix + end + "{\n", files, { "" });
+            }
+        }
+
+        json results = json::array();
+        size_t context_tokens = 0;
+        for (size_t i = 0; i < scored.items.size(); ++i) {
+            const auto & result = scored.items[i];
+            context_tokens += result.context_tokens;
+            json answers = json::object();
+            for (size_t f = 0; f < cs.specs.size(); ++f) {
+                const auto & spec = cs.specs[f];
+                const auto & field = result.fields[f];
+                if (field.winner < 0 || field.probs.size() != spec.values.size()) {
+                    throw std::runtime_error("scorer did not return a complete distribution");
+                }
+                json probs = json::object();
+                double entropy = 0, expected = 0;
+                for (size_t j = 0; j < spec.values.size(); ++j) {
+                    const std::string key = spec.values[j].is_string()
+                        ? spec.values[j].get<std::string>() : spec.values[j].dump();
+                    const double p = field.probs[j];
+                    probs[key] = p;
+                    if (p > 0) entropy -= p * std::log(p);
+                    if (!spec.numbers.empty()) expected += spec.numbers[j] * p;
+                }
+                const std::string kind = spec.type == "boolean" ? "noul" : spec.type == "enum" ? "choice" : "score";
+                json answer = { { "kind", kind }, { "value", spec.values[field.winner] },
+                    { "probability", field.probs[field.winner] }, { "probabilities", probs },
+                    { "normalized_entropy", spec.values.size() > 1 ? entropy / std::log((double) spec.values.size()) : 0.0 } };
+                answer["concentration"] = 1.0 - answer.at("normalized_entropy").get<double>();
+                if (kind == "noul") answer["p_true"] = probs.at("true");
+                if (kind == "score") answer["expected_score"] = expected;
+                answers[spec.name] = std::move(answer);
+            }
+            results.push_back({ { "state_id", ids[i] }, { "answers", answers },
+                { "usage", { { "context_tokens", result.context_tokens }, { "scored_rows", result.rows } } } });
+        }
+        return { { "object", "system1.results" }, { "model", model_name },
+            { "created", (long long) std::time(nullptr) }, { "results", results },
+            { "usage", { { "shared_tokens", scored.shared_tokens }, { "context_tokens", context_tokens },
+                { "cached_tokens", cached_tokens }, { "scored_rows", scored.rows } } },
+            { "timings", { { "parse_ms", parse_ms }, { "prefill_ms", scored.prefill_ms },
+                { "scoring_ms", scored.scoring_ms }, { "projector_encode_ms", projector_ms },
+                { "language_prefill_ms", scored.prefill_ms - projector_ms },
+                { "total_ms", scored.prefill_ms + scored.scoring_ms }, { "rounds", scored.rounds } } } };
+    }
+
+    static std::string decision_wire_text(const json & value) {
+        return value.is_string() ? value.get<std::string>() : value.dump();
+    }
+
+    static json decision_temperature(const json & probabilities, double temperature) {
+        if (!std::isfinite(temperature) || temperature <= 0) {
+            throw std::invalid_argument("temperature must be positive and finite");
+        }
+        if (temperature == 1.0) return probabilities;
+        json out = json::object();
+        double sum = 0;
+        for (auto it = probabilities.begin(); it != probabilities.end(); ++it) {
+            const double weight = std::pow(std::max(it.value().get<double>(), 1e-300), 1.0 / temperature);
+            out[it.key()] = weight;
+            sum += weight;
+        }
+        if (sum <= 0 || !std::isfinite(sum)) throw std::invalid_argument("invalid temperature normalization");
+        for (auto it = out.begin(); it != out.end(); ++it) it.value() = it.value().get<double>() / sum;
+        return out;
+    }
+
+    json handle_systemone(const json & body) {
+        if (!body.is_object() || !body.contains("state") || !body.contains("questions") ||
+            !body.at("questions").is_object() || body.at("questions").empty() ||
+            body.at("questions").size() > 32) {
+            throw std::invalid_argument("systemone requires state and 1-32 typed questions");
+        }
+        const double temperature = body.value("temperature", 1.0);
+        if (!std::isfinite(temperature) || temperature <= 0) {
+            throw std::invalid_argument("temperature must be positive and finite");
+        }
+        json properties = json::object();
+        for (auto it = body.at("questions").begin(); it != body.at("questions").end(); ++it) {
+            const auto & question = it.value();
+            if (!question.is_object() || !question.contains("type") || !question.contains("instructions")) {
+                throw std::invalid_argument("each question needs type and instructions");
+            }
+            const std::string kind = question.at("type").get<std::string>();
+            std::string description = decision_wire_text(question.at("instructions"));
+            json schema;
+            if (kind == "noul") {
+                schema = { { "type", "boolean" } };
+                if (question.contains("criteria")) {
+                    if (!question.at("criteria").is_object()) throw std::invalid_argument("noul criteria must be an object");
+                    for (const std::string key : { "true", "false" }) {
+                        if (question.at("criteria").contains(key)) {
+                            description += " " + key + ": " + decision_wire_text(question.at("criteria").at(key)) + ".";
+                        }
+                    }
+                }
+            } else if (kind == "choice") {
+                if (!question.contains("criteria") || !question.at("criteria").is_object() ||
+                    question.at("criteria").size() < 2 || question.at("criteria").size() > 255) {
+                    throw std::invalid_argument("choice criteria must contain 2-255 options");
+                }
+                json values = json::array();
+                for (auto option = question.at("criteria").begin(); option != question.at("criteria").end(); ++option) {
+                    values.push_back(option.key());
+                    if (!option.value().is_null()) description += " " + option.key() + ": " + decision_wire_text(option.value()) + ".";
+                }
+                schema = { { "type", "string" }, { "enum", values } };
+            } else if (kind == "score") {
+                if (!question.contains("criteria") || !question.at("criteria").is_array() ||
+                    question.at("criteria").size() < 2 || question.at("criteria").size() > 10) {
+                    throw std::invalid_argument("score criteria must contain 2-10 levels");
+                }
+                for (size_t i = 0; i < question.at("criteria").size(); ++i) {
+                    description += " " + std::to_string(i) + ": " + decision_wire_text(question.at("criteria").at(i)) + ".";
+                }
+                schema = { { "type", "integer" }, { "minimum", 0 },
+                           { "maximum", question.at("criteria").size() - 1 } };
+            } else {
+                throw std::invalid_argument("question type must be noul, choice or score");
+            }
+            schema["description"] = description;
+            properties[it.key()] = std::move(schema);
+        }
+        const json request = {
+            { "catalogue", { { "type", "object" }, { "properties", properties } } },
+            { "global_context", json::array({ { { "type", "text" },
+                { "text", decision_wire_text(body.at("state")) } } }) },
+            { "states", json::array({ { { "id", "state" }, { "content", json::array({
+                { { "type", "text" }, { "text", "Answer the questions." } } }) } } }) },
+            { "mode", "tree" }, { "cache_prompt", body.value("cache_prompt", true) }
+        };
+        const json core = handle_decision(request);
+        json answers = json::object();
+        for (auto it = body.at("questions").begin(); it != body.at("questions").end(); ++it) {
+            const std::string kind = it.value().at("type").get<std::string>();
+            const json probabilities = decision_temperature(core.at("results").at(0).at("answers")
+                .at(it.key()).at("probabilities"), temperature);
+            if (kind == "noul") {
+                answers[it.key()] = { { "type", "noul" }, { "noul", probabilities.at("true") } };
+                continue;
+            }
+            std::string best;
+            double best_p = -1;
+            for (auto value = probabilities.begin(); value != probabilities.end(); ++value) {
+                if (value.value().get<double>() > best_p) {
+                    best = value.key();
+                    best_p = value.value().get<double>();
+                }
+            }
+            const double confidence = std::max(0.0, best_p - (1.0 - best_p) / (probabilities.size() - 1));
+            if (kind == "choice") {
+                answers[it.key()] = { { "type", "choice" }, { "choice", best },
+                    { "probabilities", probabilities }, { "confidence", confidence } };
+            } else {
+                json legend = json::object();
+                double score = 0;
+                const auto & criteria = it.value().at("criteria");
+                for (size_t i = 0; i < criteria.size(); ++i) {
+                    const std::string key = std::to_string(i);
+                    legend[key] = decision_wire_text(criteria.at(i));
+                    score += i * probabilities.at(key).get<double>();
+                }
+                answers[it.key()] = { { "type", "score" }, { "score", score },
+                    { "legend", legend }, { "probabilities", probabilities }, { "confidence", confidence } };
+            }
+        }
+        const auto & usage = core.at("usage");
+        return { { "model", model_name }, { "answers", answers },
+            { "usage", { { "input_tokens", usage.at("shared_tokens").get<int>() +
+                usage.at("context_tokens").get<int>() }, { "output_tokens", 0 },
+                { "scored_rows", usage.at("scored_rows") } } }, { "timings", core.at("timings") } };
+    }
+
+    json handle_clm_rank(const json & body) {
+        if (!body.is_object() || !body.contains("answers") || !body.at("answers").is_array() ||
+            body.at("answers").empty() || body.at("answers").size() > 255) {
+            throw std::invalid_argument("rank requires 1-255 answer strings");
+        }
+        for (const auto & answer : body.at("answers")) {
+            if (!answer.is_string() || answer.get<std::string>().empty()) {
+                throw std::invalid_argument("answers must be non-empty strings");
+            }
+        }
+        if (body.at("answers").size() == 1) {
+            return { { "model", model_name }, { "ranked", json::array({
+                { { "rank", 1 }, { "candidate", body.at("answers").at(0) }, { "prob", 1.0 } } }) } };
+        }
+        json criteria = json::object();
+        for (size_t i = 0; i < body.at("answers").size(); ++i) {
+            criteria["a" + std::to_string(i)] = body.at("answers").at(i);
+        }
+        const json wire = handle_systemone({
+            { "state", body.contains("context") ? body.at("context") : json("") },
+            { "temperature", body.value("temperature", 1.0) },
+            { "questions", { { "rank", { { "type", "choice" },
+                { "instructions", body.contains("question") ? body.at("question") : json("Which answer is best?") },
+                { "criteria", criteria } } } } }
+        });
+        const json & probabilities = wire.at("answers").at("rank").at("probabilities");
+        std::vector<std::pair<size_t, double>> order;
+        for (size_t i = 0; i < body.at("answers").size(); ++i) {
+            order.emplace_back(i, probabilities.at("a" + std::to_string(i)).get<double>());
+        }
+        std::stable_sort(order.begin(), order.end(), [](const auto & a, const auto & b) { return a.second > b.second; });
+        json ranked = json::array();
+        for (size_t i = 0; i < order.size(); ++i) {
+            ranked.push_back({ { "rank", i + 1 }, { "candidate", body.at("answers").at(order[i].first) },
+                { "prob", order[i].second } });
+        }
+        return { { "model", model_name }, { "ranked", ranked } };
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2478,6 +2965,42 @@ private:
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
                     // do nothing
+                } break;
+            case SERVER_TASK_TYPE_DECISION:
+            case SERVER_TASK_TYPE_SYSTEMONE:
+            case SERVER_TASK_TYPE_CLM_RANK:
+                {
+                    for (const auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            queue_tasks.defer(std::move(task));
+                            return true;
+                        }
+                    }
+                    const auto clear_failed_decision = [&]() {
+                        if (finite_scorer) {
+                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), finite_scorer->snapshot_seq(), -1, -1);
+                        }
+                        decision_prompt.clear();
+                    };
+                    try {
+                        auto res = std::make_unique<server_task_result_decision>();
+                        res->id = task.id;
+                        res->data = task.type == SERVER_TASK_TYPE_SYSTEMONE
+                            ? handle_systemone(task.decision_body)
+                            : task.type == SERVER_TASK_TYPE_CLM_RANK
+                                ? handle_clm_rank(task.decision_body)
+                                : handle_decision(task.decision_body);
+                        queue_results.send(std::move(res));
+                    } catch (const std::invalid_argument & e) {
+                        clear_failed_decision();
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const common_json_error & e) {
+                        clear_failed_decision();
+                        send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
+                    } catch (const std::exception & e) {
+                        clear_failed_decision();
+                        send_error(task, e.what(), ERROR_TYPE_SERVER);
+                    }
                 } break;
             case SERVER_TASK_TYPE_METRICS:
                 {
@@ -4906,6 +5429,50 @@ void server_routes::init_routes() {
             body,
             files,
             TASK_RESPONSE_TYPE_OAI_CMPL);
+    };
+
+    this->post_decisions = [this](const server_http_req & req) {
+        auto res = create_response();
+        server_task task(SERVER_TASK_TYPE_DECISION);
+        task.id = res->rd.get_new_id();
+        task.decision_body = json::parse(req.body);
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_systemone = [this](const server_http_req & req) {
+        auto res = create_response();
+        server_task task(SERVER_TASK_TYPE_SYSTEMONE);
+        task.id = res->rd.get_new_id();
+        task.decision_body = json::parse(req.body);
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (!result) return res;
+        if (result->is_error()) res->error(result->to_json());
+        else res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_clm_rank = [this](const server_http_req & req) {
+        auto res = create_response();
+        server_task task(SERVER_TASK_TYPE_CLM_RANK);
+        task.id = res->rd.get_new_id();
+        task.decision_body = json::parse(req.body);
+        res->rd.post_task(std::move(task), true);
+        auto result = res->rd.next(req.should_stop);
+        if (!result) return res;
+        if (result->is_error()) res->error(result->to_json());
+        else res->ok(result->to_json());
+        return res;
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
