@@ -1,6 +1,18 @@
-# Reproduce the MNIST and Q*bert experiments
+# System1 for multimodal models in llama.cpp
 
-This fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) adds System1 decision endpoints to `llama-server` and scripts for two vision-language model experiments: classifying all 10,000 MNIST test images and playing the first level of Atari Q*bert from raw frames. Run commands from the repository root. Model weights are downloaded separately.
+This fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) lets `llama-server` use open vision-language models for finite-answer decisions. Given a set of allowed answers, it scores their token paths and returns a probability distribution instead of generating each answer as JSON. It uses llama.cpp's prompt cache to reuse shared text, images, or video across questions. No new classification head or model training is required.
+
+## Decision endpoints
+
+All three routes use the same finite-answer scorer:
+
+| Endpoint | Input and output |
+|---|---|
+| `POST /v1/decisions` | Native catalogue API. Accepts text, images, or video with one or more states and questions; returns probabilities for every allowed answer, plus timing and cache usage. |
+| `POST /v1/systemone` | Jev-compatible request and response shape for a state with `noul`, `choice`, or `score` questions. |
+| `POST /v1/rank` | CLM-compatible ranking shape for a text context and candidate answers. |
+
+The Jev and CLM routes adapt their request formats to this fork's scorer; they do not implement those projects' model architectures. See the [endpoint guide](docs/system1/system1-endpoints.md) for request examples, response fields, and cache behavior. `/v1/system1/decisions` remains an alias for the native route.
 
 ## Install
 
@@ -19,7 +31,11 @@ source .venv/bin/activate
 python -m pip install Pillow==12.3.0 numpy==2.5.3 gymnasium==1.2.3 ale-py==0.12.1
 ```
 
-## MNIST: full test set
+## Reproduce MNIST and Q*bert
+
+The experiments below compare normal structured output with System1 scoring on the same model and inputs. Run commands from the repository root. Model weights are downloaded separately.
+
+### MNIST: full test set
 
 The original 10,000-image test split is included in [`artifacts/datasets/mnist/`](artifacts/datasets/mnist/). Download `gemma-4-E4B-it-Q4_K_M.gguf` and `mmproj-F16.gguf` from [unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/tree/main). Start the server with the paths to the files you downloaded:
 
@@ -44,7 +60,7 @@ python tools/system1/system1-mnist-full.py \
 
 Use `--batch-size 32`, `48`, or `64` for additional batch-size runs, increasing the server's `-c` if a larger batch exceeds the context size. Each report records predictions, accuracy, prefill, answer-only, and total time for every batch. The supplied [A100 aggregate](artifacts/benchmarks/mnist-full-10000-gemma4b-a100-2026-10-01.json) contains summary values; it does not include per-batch logs or an exact model-file hash.
 
-## Q*bert: level one from raw frames
+### Q*bert: level one from raw frames
 
 Download [Qwen3.5 9B Q4_K_M and its matching vision projector](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF). The [Q*bert reproduction guide](docs/system1/qbert-reproduction.md) gives model hashes, server commands, emulator settings, and replay instructions. Only this Qwen model is needed for the current comparison. The script sends one unmodified game frame per decision, extracts the state, and asks the same model to choose the move.
 
@@ -70,7 +86,7 @@ python tools/system1/system1-qbert-results.py --run-dir "$run_dir"
 
 Each run prints its trace path, summary, and stop reason. The results command verifies both traces, writes a self-contained two-row replay, and creates a shareable zip. If the optional method traces below are present, the same command adds their individual replays and JSON files to that zip. All traces save the input frames, predicted states, agent actions, state accuracy, timings, and emulator outcomes.
 
-### Additional System1 action methods
+#### Additional System1 action methods
 
 Both methods below use the **grouped System1 frame reader**. The agent still chooses the final action.
 
